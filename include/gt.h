@@ -5,6 +5,7 @@
 
 #define GT_MAX_THREADS 128
 #define GT_STACK_SIZE (64 * 1024)
+#define GT_TIMESLICE_US 10000 /* preemption interval, in CPU-time microseconds */
 
 /* Create a new green thread running fn(arg). Returns 0 on success. */
 int gt_create(void (*fn)(void *), void *arg);
