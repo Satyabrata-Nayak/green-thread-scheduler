@@ -1,3 +1,8 @@
 bin/
 *.o
 .claude/
+
+# personal working notes — not part of the published project
+NOTES.md
+VERIFICATION.md
+green-thread-scheduler-plan.md
