@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
@@ -82,11 +83,44 @@ typedef enum {
 
 typedef struct {
     gt_ctx ctx;
-    char stack[GT_STACK_SIZE];
-    int state; /* gt_state; int so the atomic builtins can CAS it */
+    char *stack; /* usable region, mapped on first use */
+    int state;   /* gt_state; int so the atomic builtins can CAS it */
     void (*fn)(void *);
     void *arg;
 } gt_thread;
+
+/* Stacks are mapped on demand rather than embedded in the thread table, and
+   deliberately never unmapped -- a dead thread's slot keeps its stack for the
+   next thread to reuse, which turns thread creation after the first round
+   into pure bookkeeping.
+
+   Mapping matters more than it looks: an anonymous mapping costs no physical
+   memory until it is touched, so a green thread that uses 2KB of its 64KB
+   stack occupies one page, not sixteen. That is most of why 10k green threads
+   fit in memory that 10k pthreads could not.
+
+   The low page is mapped PROT_NONE as a guard: stacks grow downwards, so an
+   overflow lands there and takes a clean SIGSEGV instead of silently
+   corrupting whatever the allocator happened to place underneath.
+
+   The mapping base is not retained -- nothing ever unmaps -- and it is just
+   `stack - pagesize` if it is ever needed. */
+static char *gt_stack_map(gt_thread *t) {
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    size_t total = GT_STACK_SIZE + (size_t)page;
+
+    char *base = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) return NULL;
+    if (mprotect(base, (size_t)page, PROT_NONE) == -1) {
+        munmap(base, total);
+        return NULL;
+    }
+
+    t->stack = base + page;
+    return t->stack;
+}
 
 /* ------------------------------------------------------------------ *
  * Run queues
@@ -213,6 +247,10 @@ int gt_create(void (*fn)(void *), void *arg) {
     }
 
     gt_thread *t = &threads[idx];
+    if (!t->stack && !gt_stack_map(t)) { /* first use of this slot */
+        pthread_mutex_unlock(&table_lock);
+        return -1;
+    }
     if (gt_ctx_init(&t->ctx, t->stack, GT_STACK_SIZE, gt_trampoline) == -1) {
         pthread_mutex_unlock(&table_lock);
         return -1;

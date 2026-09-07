@@ -5,10 +5,20 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+/* Overridable at build time (-DGT_MAX_THREADS=...) so the memory benchmark
+   can ask for far more threads than a normal build needs. Stacks are mapped
+   on demand, so raising the cap costs table space, not memory. */
+#ifndef GT_MAX_THREADS
 #define GT_MAX_THREADS 128
-#define GT_MAX_WORKERS 16
+#endif
+#ifndef GT_STACK_SIZE
 #define GT_STACK_SIZE (64 * 1024)
-#define GT_TIMESLICE_US 10000 /* preemption interval, in CPU-time microseconds */
+#endif
+#ifndef GT_TIMESLICE_US
+#define GT_TIMESLICE_US 10000 /* preemption interval, CPU-time microseconds */
+#endif
+
+#define GT_MAX_WORKERS 16
 
 /* Create a new green thread running fn(arg). Returns 0 on success. Safe to
    call from inside a running green thread, so servers can spawn per-client

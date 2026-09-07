@@ -10,7 +10,13 @@ LIB = src/gt.o src/sync.o src/switch_x86_64.o
 LIB_UCTX = src/gt_uctx.o src/sync.o
 
 BINS = bin/demo bin/preempt_demo bin/io_test bin/mt_test bin/sync_test bin/echo_server \
-       bin/switch_bench bin/switch_bench_uctx bin/scaling_bench
+       bin/switch_bench bin/switch_bench_uctx bin/scaling_bench \
+       bin/pthread_switch_bench bin/memory_bench \
+       bin/pthread_echo_server bin/loadgen
+
+# The memory benchmark needs a far larger thread table than a normal build.
+# Stacks are mapped on demand, so this costs table space only.
+BIG_THREADS = 12000
 
 .PHONY: all check bench clean
 
@@ -56,6 +62,27 @@ bin/scaling_bench: bin $(LIB) bench/scaling_bench.o
 
 bin/switch_bench: bin $(LIB) bench/switch_bench.o
 	$(CC) $(CFLAGS) -o $@ $(LIB) bench/switch_bench.o $(LDFLAGS)
+
+bin/pthread_switch_bench: bin bench/pthread_switch_bench.o
+	$(CC) $(CFLAGS) -o $@ bench/pthread_switch_bench.o $(LDFLAGS)
+
+# Built with a raised thread cap. sync.o is cap-independent, so sharing it
+# between this and the normal build is safe.
+src/gt_big.o: src/gt.c
+	$(CC) $(CFLAGS) -DGT_MAX_THREADS=$(BIG_THREADS) -c -o $@ $<
+
+bench/memory_bench.o: bench/memory_bench.c
+	$(CC) $(CFLAGS) -DGT_MAX_THREADS=$(BIG_THREADS) -c -o $@ $<
+
+bin/memory_bench: bin src/gt_big.o src/sync.o src/switch_x86_64.o bench/memory_bench.o
+	$(CC) $(CFLAGS) -o $@ src/gt_big.o src/sync.o src/switch_x86_64.o \
+	      bench/memory_bench.o $(LDFLAGS)
+
+bin/pthread_echo_server: bin bench/pthread_echo_server.o
+	$(CC) $(CFLAGS) -o $@ bench/pthread_echo_server.o $(LDFLAGS)
+
+bin/loadgen: bin bench/loadgen.o
+	$(CC) $(CFLAGS) -o $@ bench/loadgen.o $(LDFLAGS)
 
 bin/switch_bench_uctx: bin $(LIB_UCTX) bench/switch_bench_uctx.o
 	$(CC) $(CFLAGS) -o $@ $(LIB_UCTX) bench/switch_bench_uctx.o $(LDFLAGS)
