@@ -6,11 +6,11 @@ LDFLAGS = -pthread
 
 # Default backend: the hand-written x86-64 switch. The ucontext build exists
 # alongside it so the benchmark can measure one against the other.
-LIB = src/gt.o src/switch_x86_64.o
-LIB_UCTX = src/gt_uctx.o
+LIB = src/gt.o src/sync.o src/switch_x86_64.o
+LIB_UCTX = src/gt_uctx.o src/sync.o
 
-BINS = bin/demo bin/preempt_demo bin/io_test bin/echo_server \
-       bin/switch_bench bin/switch_bench_uctx
+BINS = bin/demo bin/preempt_demo bin/io_test bin/mt_test bin/sync_test bin/echo_server \
+       bin/switch_bench bin/switch_bench_uctx bin/scaling_bench
 
 .PHONY: all check bench clean
 
@@ -42,8 +42,17 @@ bin/preempt_demo: bin $(LIB) tests/preempt_demo.o
 bin/io_test: bin $(LIB) tests/io_test.o
 	$(CC) $(CFLAGS) -o $@ $(LIB) tests/io_test.o $(LDFLAGS)
 
+bin/mt_test: bin $(LIB) tests/mt_test.o
+	$(CC) $(CFLAGS) -o $@ $(LIB) tests/mt_test.o $(LDFLAGS)
+
+bin/sync_test: bin $(LIB) tests/sync_test.o
+	$(CC) $(CFLAGS) -o $@ $(LIB) tests/sync_test.o $(LDFLAGS)
+
 bin/echo_server: bin $(LIB) tests/echo_server.o
 	$(CC) $(CFLAGS) -o $@ $(LIB) tests/echo_server.o $(LDFLAGS)
+
+bin/scaling_bench: bin $(LIB) bench/scaling_bench.o
+	$(CC) $(CFLAGS) -o $@ $(LIB) bench/scaling_bench.o $(LDFLAGS)
 
 bin/switch_bench: bin $(LIB) bench/switch_bench.o
 	$(CC) $(CFLAGS) -o $@ $(LIB) bench/switch_bench.o $(LDFLAGS)
@@ -55,6 +64,10 @@ check: all
 	./bin/demo
 	./bin/preempt_demo
 	./bin/io_test
+	./bin/mt_test 1
+	./bin/mt_test 4
+	./bin/sync_test 1
+	./bin/sync_test 4
 
 bench: bin/switch_bench bin/switch_bench_uctx
 	@echo "=== ucontext (swapcontext) ==="

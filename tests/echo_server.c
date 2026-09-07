@@ -3,7 +3,10 @@
    connection thread parks on its own socket. Whenever every thread is parked,
    the scheduler sleeps in epoll_wait rather than spinning.
 
-   Usage: ./bin/echo_server [port]   (default 9000) */
+   With more than one worker the connections are spread over that many OS
+   threads instead, stealing from each other as load allows.
+
+   Usage: ./bin/echo_server [port] [workers]   (default 9000, 1 worker) */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -31,8 +34,10 @@ static void connection(void *arg) {
     }
 
     close(fd);
-    live_conns--;
-    printf("[conn %d closed] live=%d total=%ld\n", fd, live_conns, total_conns);
+    /* Atomic because with several workers these really are concurrent. */
+    int live = __atomic_sub_fetch(&live_conns, 1, __ATOMIC_ACQ_REL);
+    printf("[conn %d closed] live=%d total=%ld\n", fd, live,
+           __atomic_load_n(&total_conns, __ATOMIC_ACQUIRE));
     fflush(stdout);
 }
 
@@ -52,16 +57,17 @@ static void acceptor(void *arg) {
             close(fd);
             continue;
         }
-        live_conns++;
-        total_conns++;
-        printf("[conn %d open]   live=%d total=%ld  (OS thread %lu)\n", fd,
-               live_conns, total_conns, pthread_self());
+        int live = __atomic_add_fetch(&live_conns, 1, __ATOMIC_ACQ_REL);
+        long total = __atomic_add_fetch(&total_conns, 1, __ATOMIC_ACQ_REL);
+        printf("[conn %d open]   live=%d total=%ld  (OS thread %lu)\n", fd, live, total,
+               pthread_self());
         fflush(stdout);
     }
 }
 
 int main(int argc, char **argv) {
     int port = argc > 1 ? atoi(argv[1]) : 9000;
+    int nworkers = argc > 2 ? atoi(argv[2]) : 1;
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -91,12 +97,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("echo server on port %d, single OS thread %lu -- Ctrl-C to stop\n",
-           port, pthread_self());
+    printf("echo server on port %d, %d OS thread(s), main is %lu -- Ctrl-C to stop\n",
+           port, nworkers, pthread_self());
     fflush(stdout);
 
     gt_create(acceptor, (void *)(long)listen_fd);
-    gt_run();
+    gt_run_on(nworkers);
 
     close(listen_fd);
     return 0;
