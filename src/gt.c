@@ -3,12 +3,68 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/time.h>
-#include <ucontext.h>
 #include <unistd.h>
+
+/* Two interchangeable context-switch backends. GT_UCONTEXT_SWITCH selects
+   the portable ucontext one; the default is the hand-written x86-64 switch.
+   Both are kept so the benchmark can measure one against the other. */
+
+#ifdef GT_UCONTEXT_SWITCH
+
+#include <ucontext.h>
+typedef ucontext_t gt_ctx;
+
+static inline void gt_switch(gt_ctx *from, gt_ctx *to) { swapcontext(from, to); }
+
+static int gt_ctx_init(gt_ctx *ctx, char *stack, size_t size, void (*entry)(void)) {
+    if (getcontext(ctx) == -1) return -1;
+    ctx->uc_stack.ss_sp = stack;
+    ctx->uc_stack.ss_size = size;
+    ctx->uc_link = NULL; /* the entry point never returns */
+    makecontext(ctx, entry, 0);
+    return 0;
+}
+
+#else /* hand-written switch */
+
+/* A context is just a stack pointer -- everything else lives on that stack. */
+typedef void *gt_ctx;
+
+extern void gt_switch_stack(void **save_sp, void *new_sp);
+
+static inline void gt_switch(gt_ctx *from, gt_ctx *to) {
+    gt_switch_stack((void **)from, *to);
+}
+
+/* Hand-build the stack frame that gt_switch_stack's epilogue expects, so the
+   first switch into a new thread "returns" into its entry point:
+
+       low                                                        high
+       [ r15 r14 r13 r12 rbp rbx ] [ entry ]
+       ^-- sp starts here          ^-- 16-byte aligned
+
+   The six zeroed slots are popped, then ret consumes `entry`. Placing the
+   return-address slot on a 16-byte boundary leaves rsp %16 == 8 on entry,
+   which is exactly what the ABI guarantees a function after a call. */
+static int gt_ctx_init(gt_ctx *ctx, char *stack, size_t size, void (*entry)(void)) {
+    uintptr_t top = ((uintptr_t)(stack + size)) & ~(uintptr_t)15;
+    top -= 16; /* headroom, keeps the slot 16-byte aligned */
+
+    void **sp = (void **)top;
+    *sp = (void *)entry;
+    sp -= 6; /* r15, r14, r13, r12, rbp, rbx */
+    memset(sp, 0, 6 * sizeof(void *));
+
+    *ctx = sp;
+    return 0;
+}
+
+#endif
 
 typedef enum {
     GT_FREE = 0, /* slot never used, or reclaimable */
@@ -19,7 +75,7 @@ typedef enum {
 } gt_state;
 
 typedef struct {
-    ucontext_t ctx;
+    gt_ctx ctx;
     char stack[GT_STACK_SIZE];
     gt_state state;
     void (*fn)(void *);
@@ -33,11 +89,11 @@ static int blocked = 0;   /* subset of live[] parked on an fd */
 static int current = -1;  /* index of the thread currently running */
 static int rr_cursor = 0; /* round-robin search cursor */
 static int epfd = -1;
-static ucontext_t sched_ctx;
+static gt_ctx sched_ctx;
 
 /* Set while a context switch or scheduler bookkeeping is in progress. The
    timer handler refuses to preempt during that window -- interrupting a
-   half-completed swapcontext would corrupt the saved context. Cleared by
+   half-completed context switch would corrupt the saved context. Cleared by
    whichever thread resumes, never by the scheduler, so all of gt_run runs
    non-preemptible. */
 static volatile sig_atomic_t in_switch = 0;
@@ -48,7 +104,7 @@ static void gt_trampoline(void) {
     t->fn(t->arg);
     t->state = GT_DEAD;
     in_switch = 1;
-    swapcontext(&t->ctx, &sched_ctx);
+    gt_switch(&t->ctx, &sched_ctx);
 }
 
 int gt_create(void (*fn)(void *), void *arg) {
@@ -64,16 +120,12 @@ int gt_create(void (*fn)(void *), void *arg) {
     if (idx == -1) return -1;
 
     gt_thread *t = &threads[idx];
-    if (getcontext(&t->ctx) == -1) return -1;
+    if (gt_ctx_init(&t->ctx, t->stack, GT_STACK_SIZE, gt_trampoline) == -1) return -1;
 
-    t->ctx.uc_stack.ss_sp = t->stack;
-    t->ctx.uc_stack.ss_size = GT_STACK_SIZE;
-    t->ctx.uc_link = &sched_ctx;
     t->fn = fn;
     t->arg = arg;
     t->state = GT_READY;
 
-    makecontext(&t->ctx, gt_trampoline, 0);
     if (idx >= nslots) nslots = idx + 1;
     live++;
     return 0;
@@ -84,7 +136,7 @@ void gt_yield(void) {
     gt_thread *t = &threads[current];
     t->state = GT_READY;
     in_switch = 1;
-    swapcontext(&t->ctx, &sched_ctx);
+    gt_switch(&t->ctx, &sched_ctx);
     /* resumes here once the scheduler picks this thread again */
     in_switch = 0;
 }
@@ -94,6 +146,22 @@ void gt_yield(void) {
 static void gt_preempt(int sig) {
     (void)sig;
     if (in_switch) return;
+
+    /* The kernel blocks SIGVTALRM for the duration of its own handler and
+       lifts it again when the handler returns, via sigreturn. We are about to
+       leave without returning -- the switch below resumes a different thread
+       entirely -- so that automatic unblock would never happen and this would
+       be the last preemption the program ever saw.
+
+       swapcontext() hides this by saving and restoring the signal mask on
+       every switch, which is exactly the rt_sigprocmask syscall the
+       hand-written switch exists to avoid. Lifting the block explicitly costs
+       one syscall per timer tick (100/sec) instead of one per switch. */
+    sigset_t vtalrm;
+    sigemptyset(&vtalrm);
+    sigaddset(&vtalrm, SIGVTALRM);
+    sigprocmask(SIG_UNBLOCK, &vtalrm, NULL);
+
     gt_yield();
 }
 
@@ -151,7 +219,7 @@ static int gt_wait(int fd, uint32_t events) {
     in_switch = 1;
     t->state = GT_BLOCKED;
     blocked++;
-    swapcontext(&t->ctx, &sched_ctx);
+    gt_switch(&t->ctx, &sched_ctx);
     in_switch = 0;
 
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
@@ -250,7 +318,7 @@ void gt_run(void) {
         current = idx;
         threads[idx].state = GT_RUNNING;
         in_switch = 1; /* the resumed thread clears it */
-        swapcontext(&sched_ctx, &threads[idx].ctx);
+        gt_switch(&sched_ctx, &threads[idx].ctx);
 
         if (threads[idx].state == GT_DEAD) live--;
     }

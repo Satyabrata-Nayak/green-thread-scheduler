@@ -17,11 +17,16 @@
 #define WORK_ITERS 30000000L
 #define TRACE_MAX 512
 
+/* volatile is load-bearing, not decoration: the spin loop below contains no
+   function calls, so at -O2 the compiler would happily cache last_run in a
+   register for the whole loop and the thread would never notice it had been
+   descheduled and resumed. Same reason the scheduler's in_switch flag is
+   volatile -- these are written by a control flow the optimiser cannot see. */
 static int trace[TRACE_MAX];
-static int trace_len = 0;
-static int last_run = -1;
+static volatile int trace_len = 0;
+static volatile int last_run = -1;
 static volatile long sink[NTHREADS];
-static long switches[NTHREADS];
+static volatile long switches[NTHREADS];
 
 static void spinner(void *arg) {
     long id = (long)arg;
