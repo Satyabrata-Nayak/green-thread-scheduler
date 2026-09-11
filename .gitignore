@@ -5,4 +5,5 @@ bin/
 # personal working notes — not part of the published project
 NOTES.md
 VERIFICATION.md
+Project_companion.md
 green-thread-scheduler-plan.md
